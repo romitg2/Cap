@@ -411,6 +411,57 @@ impl ScannedRecording {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `recording-meta.json` parses on this test thread, so a repeat scan of
+    /// an unchanged bundle can be proven to reuse [`meta_cache`] instead of
+    /// re-reading and re-parsing the file.
+    static META_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+type MetaCache = std::sync::Mutex<std::collections::HashMap<PathBuf, (std::time::SystemTime, RecordingMeta)>>;
+
+/// Parsed `recording-meta.json`s, keyed by bundle path, valid as long as the
+/// file's own mtime matches. The 2s poll behind an in-progress recording
+/// (`settings_window.rs`'s `arm_recordings_poll`) and this module's three
+/// other callers (`main.rs`, `tray.rs`, `main_window.rs`'s Recents) each
+/// re-run a full library scan; without this, every one of those re-reads and
+/// re-parses every bundle's metadata from scratch, including the hundreds
+/// that have not changed since the last scan a moment ago.
+fn meta_cache() -> &'static MetaCache {
+    static CACHE: std::sync::OnceLock<MetaCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `RecordingMeta::load_for_project`, through [`meta_cache`]. A bundle whose
+/// `recording-meta.json` has not been touched since it was last parsed (the
+/// common case: every complete recording, on every poll tick while a
+/// different recording is still being written) returns the cached value
+/// without touching the filesystem a second time.
+fn cached_recording_meta(path: &Path) -> Option<RecordingMeta> {
+    let modified = std::fs::metadata(path.join("recording-meta.json"))
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    if let Some((cached_modified, meta)) = meta_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        && *cached_modified == modified
+    {
+        return Some(meta.clone());
+    }
+
+    #[cfg(test)]
+    META_PARSES.with(|parses| parses.set(parses.get() + 1));
+
+    let meta = RecordingMeta::load_for_project(path).ok()?;
+    meta_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), (modified, meta.clone()));
+    Some(meta)
+}
+
 fn scanned_recordings_in(dirs: &[PathBuf]) -> impl Iterator<Item = ScannedRecording> {
     let mut paths = Vec::new();
     for dir in dirs {
@@ -427,8 +478,25 @@ fn scanned_recordings_in(dirs: &[PathBuf]) -> impl Iterator<Item = ScannedRecord
         }
     }
     paths.sort_by(|(_, a), (_, b)| b.total_cmp(a));
+    // Bundles that no longer exist (deleted since the last scan) would
+    // otherwise accumulate here forever. A `read_dir` of `dir` saw every
+    // bundle in it that still exists, so a cached entry whose *parent* is one
+    // of `dirs` and that did not turn up is gone -- but a cached entry under
+    // some other directory (a different caller's subset, a different test's
+    // root) was never looked at this call and must be left alone.
+    let dir_set: HashSet<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    let seen: HashSet<&Path> = paths.iter().map(|(path, _)| path.as_path()).collect();
+    meta_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|path, _| {
+            !path
+                .parent()
+                .is_some_and(|parent| dir_set.contains(parent))
+                || seen.contains(path.as_path())
+        });
     paths.into_iter().filter_map(|(path, sort_time_millis)| {
-        let meta = RecordingMeta::load_for_project(&path).ok()?;
+        let meta = cached_recording_meta(&path)?;
         Some(ScannedRecording {
             path,
             meta,
@@ -1820,6 +1888,110 @@ mod tests {
         assert_eq!(bounded[1].clip_count, 3);
         assert!(recording_items_in(&dirs).take(0).next().is_none());
         assert_eq!(recording_items_in(&dirs).take(20).collect::<Vec<_>>(), full);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `cached_recording_meta`'s point: the 2s poll behind an in-progress
+    /// recording re-scans the whole library every tick, and every complete
+    /// bundle in it should cost nothing on a repeat scan.
+    #[test]
+    fn unchanged_bundles_are_not_reparsed_on_a_repeat_scan() {
+        let root = temp_dir("unchanged-bundles-not-reparsed");
+        write_bundle(
+            &root,
+            "a",
+            r#"{"pretty_name":"A","sharing":null,"fps":30,"sample_rate":48000}"#,
+        );
+        write_bundle(
+            &root,
+            "b",
+            r#"{"pretty_name":"B","sharing":null,"fps":30,"sample_rate":48000}"#,
+        );
+        let dirs = [root.clone()];
+
+        let before = META_PARSES.with(std::cell::Cell::get);
+        let first = list_recordings_in(&dirs);
+        assert_eq!(META_PARSES.with(std::cell::Cell::get) - before, 2);
+
+        let before = META_PARSES.with(std::cell::Cell::get);
+        let second = list_recordings_in(&dirs);
+        assert_eq!(
+            META_PARSES.with(std::cell::Cell::get) - before,
+            0,
+            "an unchanged bundle must not be re-parsed"
+        );
+        assert_eq!(second, first);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The flip side: a bundle whose `recording-meta.json` actually changed
+    /// (the case the 2s poll exists for -- a recording still being written)
+    /// must still be re-parsed and the new value returned, and an untouched
+    /// sibling must still be served from cache.
+    #[test]
+    fn a_changed_bundle_is_reparsed_and_its_sibling_stays_cached() {
+        let root = temp_dir("changed-bundle-reparsed");
+        let changing = write_bundle(
+            &root,
+            "changing",
+            r#"{"pretty_name":"Before","sharing":null,"fps":30,"sample_rate":48000}"#,
+        );
+        write_bundle(
+            &root,
+            "stable",
+            r#"{"pretty_name":"Stable","sharing":null,"fps":30,"sample_rate":48000}"#,
+        );
+        let dirs = [root.clone()];
+        list_recordings_in(&dirs);
+
+        std::thread::sleep(std::time::Duration::from_millis(6));
+        std::fs::write(
+            changing.join("recording-meta.json"),
+            r#"{"pretty_name":"After","sharing":null,"fps":30,"sample_rate":48000}"#,
+        )
+        .unwrap();
+
+        let before = META_PARSES.with(std::cell::Cell::get);
+        let items = list_recordings_in(&dirs);
+        assert_eq!(
+            META_PARSES.with(std::cell::Cell::get) - before,
+            1,
+            "only the changed bundle should be re-parsed"
+        );
+        assert!(items.iter().any(|item| item.pretty_name == "After"));
+        assert!(items.iter().any(|item| item.pretty_name == "Stable"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A bundle deleted between scans must not linger in [`meta_cache`]
+    /// forever -- it is pruned the moment a scan no longer sees it.
+    #[test]
+    fn a_deleted_bundle_is_pruned_from_the_cache() {
+        let root = temp_dir("deleted-bundle-pruned");
+        let gone = write_bundle(
+            &root,
+            "gone",
+            r#"{"pretty_name":"Gone","sharing":null,"fps":30,"sample_rate":48000}"#,
+        );
+        let dirs = [root.clone()];
+        list_recordings_in(&dirs);
+        assert!(
+            meta_cache()
+                .lock()
+                .unwrap()
+                .contains_key(&gone),
+            "the bundle should be cached after its first scan"
+        );
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        list_recordings_in(&dirs);
+        assert!(
+            !meta_cache().lock().unwrap().contains_key(&gone),
+            "a deleted bundle must be pruned, not kept forever"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
